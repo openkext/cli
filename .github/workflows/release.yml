@@ -1,0 +1,26 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - run: zsh tests/run.zsh
+      - name: Check the version in the script matches the tag
+        run: |
+          v=$(sed -n 's/^typeset -g VERSION="\(.*\)"$/\1/p' openkext.zsh)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "VERSION=$v but tag is $GITHUB_REF_NAME"; exit 1; }
+      - run: shasum -a 256 openkext.zsh > openkext.zsh.sha256
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" openkext.zsh openkext.zsh.sha256 \
+            --title "openkext $GITHUB_REF_NAME" --generate-notes
+      - env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        if: env.GH_TOKEN != ''
+        run: gh api repos/openkext/openkext.github.io/dispatches -f event_type=cli-released
