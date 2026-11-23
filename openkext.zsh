@@ -61,6 +61,7 @@ openkext $VERSION: install hackintosh drivers from the OpenKext catalog
   openkext --all        list every driver in the catalog, not only matches
   openkext --efi PATH   use this EFI volume (the folder that holds EFI/OC)
   openkext --restore    put back an EFI/OC backup made by an earlier run
+  openkext --state DIR  keep backups and the log in DIR
 
 One-liner:  zsh -c "\$(curl -fsSL https://openkext.org/install)"
 With flags: zsh -c "\$(curl -fsSL https://openkext.org/install)" openkext --dry-run
@@ -79,6 +80,7 @@ parse_args() {
       --restore) O_RESTORE=1 ;;
       --efi) (( $# >= 2 )) || die "--efi needs a path"; O_EFI=$2; shift ;;
       --efi=*) O_EFI=${1#--efi=} ;;
+      --state) (( $# >= 2 )) || die "--state needs a path"; STATE=$2; shift ;;
       --version|-V) print -r -- "openkext $VERSION"; exit 0 ;;
       --help|-h) usage; exit 0 ;;
       *) die "unknown option: $1 (see --help)" ;;
@@ -106,6 +108,7 @@ plist_get() { plutil -extract "$2" raw -o - "$1" 2>/dev/null }
 
 cleanup() {
   tui_close
+  (( ${DIRTY:-0} )) && rollback
   [[ -n $WORK && -d $WORK ]] && rm -rf "$WORK"
   if (( MOUNTED_BY_US )) && [[ -n $ESP_DEV ]]; then
     diskutil unmount "$ESP_DEV" >/dev/null 2>&1 || sudo -n diskutil unmount "$ESP_DEV" >/dev/null 2>&1
@@ -189,26 +192,31 @@ locate_efi() {
   bp=$(nvram "${OC_GUID}:boot-path" 2>/dev/null)
   [[ $bp =~ 'GPT,([0-9A-Fa-f-]{36})' ]] && uuid=${match[1]:u}
   esps=($(esp_list))
+  local matched=0
   for dev in $esps; do
     puuid=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Partition UUID/ {print toupper($2)}')
-    if [[ -n $uuid && $puuid == $uuid ]]; then cands=($dev); break; fi
+    if [[ -n $uuid && $puuid == $uuid ]]; then cands=($dev); matched=1; break; fi
     cands+=($dev)
   done
   (( ${#cands} )) || return 1
-  if (( ${#cands} > 1 )); then
+  if [[ -n $uuid ]] && (( ! matched )); then
+    # OpenCore booted from a partition we can't see (an installer USB, for example): never guess
+    warn "OpenCore booted from partition $uuid, which is not an EFI partition on a disk here."
+    return 1
+  fi
+  if (( ! matched )); then
     # several disks with an EFI partition and no boot-path match: prefer mounted ones with OpenCore
     local -a withoc
     for dev in $cands; do
       local m=$(esp_mountpoint $dev)
       [[ -n $m && -f $m/EFI/OC/config.plist ]] && withoc+=($dev)
     done
-    if (( ${#withoc} == 1 )); then cands=($withoc)
-    elif (( O_YES || O_LIST )); then return 1
-    else
-      tui_menu "Which EFI partition holds the OpenCore you boot?" \
-        "OpenCore did not report its boot partition, so pick one." $cands || return 1
-      cands=(${cands[REPLY_IDX]})
-    fi
+    (( ${#withoc} )) && cands=($withoc)
+    (( O_YES || O_LIST )) && return 1
+    tui_menu "Which EFI partition holds the OpenCore you boot?" \
+      "OpenCore did not report its boot partition, so pick one." $cands || return 1
+    tui_close
+    cands=(${cands[REPLY_IDX]})
   fi
   ESP_DEV=${cands[1]}
   ESP_MNT=$(esp_mountpoint $ESP_DEV)
@@ -272,29 +280,31 @@ function vcmp(a, b) {
 }
 const ID = /^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$/, SAFE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,199}$/, SHA = /^[0-9a-f]{64}$/,
   SRC = /^https:\/\/github\.com\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/, BID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,119}$/;
-const RANK = { 'community-verified': 0, 'author-tested': 1, 'submitted': 2, 'reported-broken': 3 };
-const GROUP = { match: 0, installed: 1, other: 2 };
+const map = o => Object.assign(Object.create(null), o);
+const RANK = map({ 'community-verified': 0, 'author-tested': 1, 'submitted': 2, 'reported-broken': 3 });
+const GROUP = map({ match: 0, installed: 1, other: 2 });
 function run(argv) {
   const [catPath, hwPath, instPath, macos] = argv;
   let cat;
   try { cat = JSON.parse(read(catPath)); } catch (e) { return 'ERROR' + US + 'the catalog is not valid JSON'; }
   if (!cat || !Array.isArray(cat.kexts)) return 'ERROR' + US + 'the catalog has no kexts list';
-  const hw = {};
+  const hw = map({});
   read(hwPath).split('\n').forEach(l => { const f = l.split('\t'); if (f.length >= 2) hw[f[0] + ' ' + f[1]] = f[2] || ''; });
-  const inst = {};
+  const inst = map({});
   read(instPath).split('\n').forEach(l => { const f = l.split('\t'); if (f[0] && !(f[0] in inst)) inst[f[0]] = f[1] || '?'; });
   const rows = [];
-  for (const k of cat.kexts) {
+  for (const k of cat.kexts) { try {
     if (!k || k.kind !== 'kext' || !ID.test(k.id || '') || !SRC.test(k.source || '')) continue;
-    const st = (k.status && RANK[k.status.status] !== undefined) ? k.status.status : 'submitted';
+    const st = (k.status && typeof k.status.status === 'string' && RANK[k.status.status] !== undefined) ? k.status.status : 'submitted';
     const rels = Array.isArray(k.releases) ? k.releases : [];
     if (!rels.length) continue;
     let ri = 0;
+    if (!rels.every(r => r && typeof r === 'object')) continue;
     rels.forEach((r, i) => { if (String(r.date) >= String(rels[ri].date)) ri = i; });
     const rel = rels[ri];
     if (!SAFE.test(rel.tag || '') || !SAFE.test(rel.version || '')) continue;
     const matches = [];
-    (Array.isArray(k.hardware) ? k.hardware : []).forEach(h => ['pci', 'usb'].forEach(bus =>
+    (Array.isArray(k.hardware) ? k.hardware : []).filter(h => h && typeof h === 'object').forEach(h => ['pci', 'usb'].forEach(bus =>
       (Array.isArray(h[bus + '_ids']) ? h[bus + '_ids'] : []).forEach(id => {
         if ((bus + ' ' + id) in hw) matches.push(clean(h.description, 60) + ' (' + clean(id, 9) + ')');
       })));
@@ -306,19 +316,20 @@ function run(argv) {
       vcmp(macos.split('.').slice(0, hi.split('.').length).join('.'), hi) <= 0);
     const assets = (Array.isArray(rel.assets) ? rel.assets : []).filter(a => a && SAFE.test(a.name || '') && SHA.test(a.sha256 || ''))
       .map(a => { const m = clean(a.macos, 20).replace(/[,;]/g, ''); const fit = !m || (macos + '.').startsWith(m + '.');
-        return [a.name, a.sha256, m, fit ? 1 : 0].join(','); });
+        // debug builds are never selected by default
+        return [a.name, a.sha256, m, fit ? 1 : 0, fit && !/debug/i.test(a.name) ? 1 : 0].join(','); });
     if (!assets.length) continue;
-    const anyFit = assets.some(a => a.endsWith(',1'));
+    const anyFit = assets.some(a => a.split(',')[3] === '1');
     const same = !!iv && iv.replace(/^v/i, '') === String(rel.version).replace(/^v/i, '');
-    const state = !anyFit ? 'noasset' : same ? 'current' : iv ? 'update' : 'new';
+    const state = !bids.length ? 'nobundle' : !anyFit ? 'noasset' : same ? 'current' : iv ? 'update' : 'new';
     const group = matches.length ? 'match' : iv ? 'installed' : 'other';
-    const rec = group !== 'other' && inRange && anyFit && !same && (st === 'community-verified' || st === 'author-tested') ? 1 : 0;
+    const rec = group !== 'other' && inRange && anyFit && bids.length && !same && (st === 'community-verified' || st === 'author-tested') ? 1 : 0;
     const why = matches.length ? 'matches ' + [...new Set(matches)].join(', ') : iv ? 'installed on this machine' : '';
     rows.push({ rec, group, st, name: clean(k.name, 80), line: [k.id, clean(k.name, 80), st, rel.version, state, rec, why, iv,
       k.source, rel.tag, assets.join(';'), clean(k.summary, 280), clean(k.license, 40),
       (Array.isArray(k.maintainers) ? k.maintainers : []).map(x => clean(x, 39)).join(' '), clean(k.ai_disclosure, 280),
       lo + ' to ' + hi, inRange ? 1 : 0, clean(rel.notes, 500), group, bids.join(' ')].join(US) });
-  }
+  } catch (e) { /* one malformed entry must not break the tool for everyone */ } }
   rows.sort((a, b) => (b.rec - a.rec) || (GROUP[a.group] - GROUP[b.group]) || (RANK[a.st] - RANK[b.st]) || a.name.localeCompare(b.name));
   return rows.map(r => r.line).join('\n');
 }
@@ -434,6 +445,7 @@ action_text() {
     update) print -rn -- "update $K_IVER[i] → $K_VER[i]" ;;
     current) print -rn -- "up to date ($K_VER[i])" ;;
     noasset) print -rn -- "no build for macOS ${MACOS%%.*}" ;;
+    nobundle) print -rn -- "not installable (no bundle_ids)" ;;
   esac
 }
 
@@ -549,6 +561,7 @@ tui_select() {
       down) (( cur < ${#VIS} )) && (( cur++ )) ;;
       space|x)
         if [[ $K_STATE[i] == noasset ]]; then msg="$K_NAME[i] has no file built for macOS ${MACOS%%.*}."
+        elif [[ $K_STATE[i] == nobundle ]]; then msg="$K_NAME[i] does not list its bundle_ids in the catalog, so this tool can't install it safely."
         elif (( SEL[i] )); then SEL[i]=0
         else SEL[i]=1; [[ $ASEL[i] == *1* ]] || ASEL[i]=$(default_flags "$K_ASSETS[i]")
           [[ $K_STATUS[i] == reported-broken ]] && msg="Careful: testers report $K_NAME[i] as broken on its newest release."
@@ -577,7 +590,7 @@ tui_review() {
     add " $(fit "Target: $OC" $(( COLS - 2 )))"
     add " ${C_D}$(fit "First, EFI/OC is copied to $STATE/backups so you can undo with --restore." $(( COLS - 2 )))${C_R}"
     add ""
-    local -a warns
+    local -a warns; warns=()
     for (( i = 1; i <= ${#K_ID}; i++ )); do
       (( SEL[i] )) || continue
       add " ${C_B}•${C_R} $(fit "$K_NAME[i]  $(action_text $i)" $(( COLS - 4 )))"
@@ -613,18 +626,61 @@ tui_review() {
 # --------------------------------------------------------------------------------------------
 # install
 
-# Copies EFI/OC to the state folder. Prints the backup path.
+# The install is a transaction. Phase 1 downloads, checks and stages every kext in $WORK and edits
+# a copy of config.plist; the EFI is not touched, and any problem stops here with nothing changed.
+# Phase 2 makes a complete backup, then swaps the staged kexts and the new config.plist in. While
+# phase 2 runs, DIRTY=1, and an interruption or failure puts the backup back (see cleanup).
+
+typeset -gi DIRTY=0
+typeset -g BACKUP=""
+typeset -gA PLAN_OLD EFI_BID
+typeset -ga KX
+typeset -g BID_RE='^[A-Za-z0-9][A-Za-z0-9._-]{2,119}$'
+typeset -g KEXT_RE='^[A-Za-z0-9][A-Za-z0-9._+-]{0,99}\.kext$'
+typeset -g EXE_RE='^[A-Za-z0-9][A-Za-z0-9._+-]{0,99}$'
+
+# Copies EFI/OC to the state folder; $1 = pre-install or pre-restore. Prints the backup path.
 backup_oc() {
-  local ts=$(date +%Y%m%d-%H%M%S) dst n=1
+  local kind=$1 ts=$(date +%Y%m%d-%H%M%S) dst n=1
   dst="$STATE/backups/$ts"
   while [[ -e $dst ]]; do dst="$STATE/backups/$ts-$(( ++n ))"; done
-  mkdir -p "$dst" || die "could not create $dst"
-  ditto "$OC" "$dst/OC" 2>/dev/null || w ditto "$OC" "$dst/OC" || die "backup failed; nothing was changed"
+  mkdir -p "$dst" || return 1
+  if ! { ditto "$OC" "$dst/OC" 2>/dev/null || w ditto "$OC" "$dst/OC" }; then
+    rm -rf "$dst" 2>/dev/null; return 1
+  fi
   {
-    print -r -- "date=$ts"; print -r -- "efi=$EFI_LABEL"; print -r -- "oc=$OC"
+    print -r -- "date=$ts"; print -r -- "kind=$kind"; print -r -- "efi=$EFI_LABEL"; print -r -- "oc=$OC"
     print -r -- "macos=$MACOS"; print -r -- "opencore=$OCVER"; print -r -- "openkext=$VERSION"
-  } >"$dst/manifest.txt"
+    print -r -- "complete=1"   # written last: a backup without it was interrupted
+  } >"$dst/manifest.txt" || return 1
   print -r -- "$dst"
+}
+
+manifest() { sed -n "s/^$2=//p" "$1/manifest.txt" 2>/dev/null | head -1 }
+backup_ok() { [[ $(manifest "$1" complete) == 1 && -f $1/OC/config.plist ]] }
+
+# Replaces $OC with the OC folder of backup $1 without ever leaving the EFI without an OC folder.
+restore_into() {
+  local src=$1/OC
+  w rm -rf "$OC.openkext-restore" "$OC.openkext-old" 2>/dev/null
+  w ditto "$src" "$OC.openkext-restore" || { w rm -rf "$OC.openkext-restore"; return 1 }
+  w mv "$OC" "$OC.openkext-old" || return 1
+  if ! w mv "$OC.openkext-restore" "$OC"; then w mv "$OC.openkext-old" "$OC"; return 1; fi
+  w rm -rf "$OC.openkext-old"
+}
+
+# called from cleanup when phase 2 was interrupted or failed
+rollback() {
+  trap '' INT TERM
+  DIRTY=0
+  print -r -- "" >&2
+  print -r -- "${C_Y}The install did not finish; putting EFI/OC back from $BACKUP...${C_R}" >&2
+  if restore_into "$BACKUP"; then
+    print -r -- "  ${C_G}✓${C_R} EFI/OC is back to how it was. Nothing was changed." >&2; log "rolled back from $BACKUP"
+  else
+    print -r -- "${C_RED}Could not put the backup back.${C_R} Copy $BACKUP/OC over $OC by hand before rebooting." >&2
+    log "rollback FAILED from $BACKUP"
+  fi
 }
 
 download_asset() { # url sha dest
@@ -637,117 +693,116 @@ download_asset() { # url sha dest
   fi
 }
 
-# kext bundles in an extracted release, skipping debug symbols and kexts nested in other kexts
-find_kexts() {
-  local root=$1 k
+# kext bundles in an extracted release, skipping debug symbols, nested kexts and odd paths. Sets KX.
+collect_kexts() {
+  local root=${1:A} k
+  KX=()
   for k in "$root"/**/*.kext(/N); do
-    [[ $k == *.dSYM/* || $k == *.kext/*.kext ]] && continue
-    print -r -- "$k"
+    [[ $k == *.dSYM/* || $k == *.kext/*.kext || $k == *[[:cntrl:]]* ]] && continue
+    [[ ${k:A} == "$root"/* ]] || continue
+    KX+=("$k")
   done
 }
 
 kext_ok() { # sanity checks on a kext from a download
-  local k=$1 name=${1:t}
-  [[ $name =~ '^[A-Za-z0-9][A-Za-z0-9._+-]*\.kext$' ]] || { warn "skipping $name: unexpected name"; return 1 }
+  local k=$1 name=${1:t} bid exe
+  [[ $name =~ $KEXT_RE ]] || { warn "skipping a kext with an unexpected folder name"; return 1 }
   [[ -f $k/Contents/Info.plist ]] || { warn "skipping $name: no Contents/Info.plist"; return 1 }
   [[ -z $(find "$k" -type l -print -quit) ]] || { warn "skipping $name: contains symbolic links"; return 1 }
-  plist_get "$k/Contents/Info.plist" CFBundleIdentifier >/dev/null || { warn "skipping $name: no bundle identifier"; return 1 }
+  bid=$(plist_get "$k/Contents/Info.plist" CFBundleIdentifier)
+  [[ $bid =~ $BID_RE ]] || { warn "skipping $name: missing or invalid bundle identifier"; return 1 }
+  exe=$(plist_get "$k/Contents/Info.plist" CFBundleExecutable)
+  [[ -z $exe || $exe =~ $EXE_RE ]] || { warn "skipping $name: invalid CFBundleExecutable"; return 1 }
 }
 
-# installs one kext folder into $OC/Kexts and $CFG (a working copy of config.plist)
-install_kext() {
-  local k=$1 kid=$2 kver=$3 dry=$4
-  local name=${k:t} bid exe old="" e idx bp en
+# Info.plist of a kext as it will be after the install: staged copy first, then the EFI
+kext_info() { [[ -f $WORK/staged/$1/Contents/Info.plist ]] && print -r -- "$WORK/staged/$1/Contents/Info.plist" || print -r -- "$OC/Kexts/$1/Contents/Info.plist" }
+
+cfg_set() { plutil -replace "Kernel.Add.${1}.${2}" "-$3" "$4" "$CFG" 2>/dev/null }
+
+# Stages one kext folder and records its config.plist change in $CFG. $4 = the project's bundle ids.
+stage_kext() {
+  local k=$1 kid=$2 kver=$3 allowed=" $4 " dry=$5
+  local name=${k:t} bid exe old="" f idx bp en
   bid=$(plist_get "$k/Contents/Info.plist" CFBundleIdentifier)
+  if [[ $allowed != *" $bid "* ]]; then say "  - $name is not one of this project's kexts ($bid); left out"; return 0; fi
   exe=$(plist_get "$k/Contents/Info.plist" CFBundleExecutable)
   [[ -n $exe && -f $k/Contents/MacOS/$exe ]] && exe="Contents/MacOS/$exe" || exe=""
-  # an installed kext with the same bundle id gets replaced, whatever its folder name
-  local other
-  for other in "$OC"/Kexts/*.kext; do
-    [[ $(plist_get "$other/Contents/Info.plist" CFBundleIdentifier) == "$bid" ]] && { old=${other:t}; break }
-  done
-  if (( dry )); then
-    if [[ -n $old ]]; then ok "would replace Kexts/$old with $name ($bid)"; else ok "would add Kexts/$name ($bid)"; fi
-  else
-    [[ -n $old ]] && { w rm -rf "$OC/Kexts/$old" || return 1 }
-    w ditto "$k" "$OC/Kexts/$name" || return 1
-    if [[ -n $old && $old != $name ]]; then ok "replaced Kexts/$old with $name"; elif [[ -n $old ]]; then ok "updated Kexts/$name"
-    else ok "copied Kexts/$name"; fi
+  local -a olds; olds=()
+  for f in ${(k)EFI_BID}; do [[ $EFI_BID[$f] == "$bid" ]] && olds+=("$f"); done
+  if (( ${#olds} > 1 )); then
+    warn "your EFI has ${#olds} kexts with bundle id $bid (${(j:, :)olds}). Keep one of them and run again."; return 1
   fi
-  # config.plist entry
-  local found=-1 lastidx=-1
+  old=${olds[1]:-}
+  if [[ -z $old && -n ${EFI_BID[$name]:-} ]]; then
+    warn "Kexts/$name already exists with another bundle id (${EFI_BID[$name]}); not replacing it"; return 1
+  fi
+  rm -rf "$WORK/staged/$name"
+  ditto "$k" "$WORK/staged/$name" || return 1
+  PLAN_OLD[$name]=$old
+  local verb="will"; (( dry )) && verb="would"
+  local v=$(plist_get "$k/Contents/Info.plist" CFBundleShortVersionString)
+  if [[ -n $old && $old != $name ]]; then ok "$verb replace Kexts/$old with $name ${v}"
+  elif [[ -n $old ]]; then ok "$verb update Kexts/$name to ${v}"
+  else ok "$verb add Kexts/$name ${v} ($bid)"; fi
+  # config.plist entry: reuse the one for this folder or the folder it replaces
+  local found=-1
   while IFS=$TAB read -r idx bp en; do
-    lastidx=$idx
     [[ $bp == "$name" || ( -n $old && $bp == "$old" ) ]] && { found=$idx; break }
   done < <(cfg_entries "$CFG")
   if (( found >= 0 )); then
-    $PB -c "Set :Kernel:Add:${found}:BundlePath $name" -c "Set :Kernel:Add:${found}:Enabled true" "$CFG" >/dev/null 2>&1 \
-      || return 1
-    $PB -c "Set :Kernel:Add:${found}:ExecutablePath $exe" "$CFG" >/dev/null 2>&1 \
-      || $PB -c "Add :Kernel:Add:${found}:ExecutablePath string $exe" "$CFG" >/dev/null 2>&1
-    (( dry )) && ok "would update its config.plist entry" || ok "config.plist entry updated and enabled"
+    cfg_set $found BundlePath string "$name" && cfg_set $found Enabled bool true \
+      && cfg_set $found ExecutablePath string "$exe" || return 1
+    ok "$verb update its config.plist entry and enable it"
   else
     # insert before any kext that depends on this one, otherwise at the end
     local n; n=$(plutil -extract Kernel.Add raw -o - "$CFG" 2>/dev/null); [[ $n == <-> ]] || n=0
     local pos=$n dep
     while IFS=$TAB read -r idx bp en; do
-      [[ -f $OC/Kexts/$bp/Contents/Info.plist ]] || continue
-      for dep in ${(f)"$(plist_get "$OC/Kexts/$bp/Contents/Info.plist" OSBundleLibraries)"}; do
+      [[ -n $bp && $bp != */* ]] || continue
+      for dep in ${(f)"$(plist_get "$(kext_info "$bp")" OSBundleLibraries)"}; do
         [[ $dep == "$bid" ]] && { (( idx < pos )) && pos=$idx; break }
       done
     done < <(cfg_entries "$CFG")
-    $PB -c "Add :Kernel:Add:$pos dict" \
-        -c "Add :Kernel:Add:${pos}:Arch string Any" \
-        -c "Add :Kernel:Add:${pos}:BundlePath string $name" \
-        -c "Add :Kernel:Add:${pos}:Comment string OpenKext $kid $kver" \
-        -c "Add :Kernel:Add:${pos}:Enabled bool true" \
-        -c "Add :Kernel:Add:${pos}:ExecutablePath string $exe" \
-        -c "Add :Kernel:Add:${pos}:MaxKernel string" \
-        -c "Add :Kernel:Add:${pos}:MinKernel string" \
-        -c "Add :Kernel:Add:${pos}:PlistPath string Contents/Info.plist" "$CFG" >/dev/null || return 1
-    (( dry )) && ok "would add a config.plist entry at position $pos" || ok "config.plist entry added at position $pos"
+    # every value was checked against a strict pattern, so it is safe inside JSON quotes
+    plutil -insert "Kernel.Add.${pos}" -json "{\"Arch\":\"Any\",\"BundlePath\":\"$name\",\"Comment\":\"OpenKext $kid $kver\",\
+\"Enabled\":true,\"ExecutablePath\":\"$exe\",\"MaxKernel\":\"\",\"MinKernel\":\"\",\"PlistPath\":\"Contents/Info.plist\"}" \
+      "$CFG" 2>/dev/null || return 1
+    ok "$verb add a config.plist entry at position $pos"
   fi
-  print -r -- "$bid" >>"$WORK/new-bundles"
+  [[ $(plist_get "$CFG" "Kernel.Add.$(( found >= 0 ? found : pos )).BundlePath") == "$name" ]] || return 1
   print -r -- "${name}${TAB}${bid}" >>"$WORK/new-kexts"
 }
 
-# warns about dependencies that are neither in macOS nor in the EFI
+# warns about dependencies that are neither in macOS nor in the EFI after the install
 check_deps() {
-  local name bid dep have k
+  local name bid dep f
   local -A present
-  for k in "$OC"/Kexts/*.kext "$WORK"/staged/*.kext; do
-    bid=$(plist_get "$k/Contents/Info.plist" CFBundleIdentifier)
-    [[ -n $bid ]] && present[$bid]=1
+  for f in ${(k)EFI_BID}; do
+    present[$EFI_BID[$f]]=1
   done
-  [[ -f $WORK/new-bundles ]] && for bid in ${(f)"$(<"$WORK/new-bundles")"}; do [[ -n $bid ]] && present[$bid]=1; done
   [[ -f $WORK/new-kexts ]] || return 0
+  while IFS=$TAB read -r name bid; do present[$bid]=1; done <"$WORK/new-kexts"
   while IFS=$TAB read -r name bid; do
-    local info="$WORK/staged/$name/Contents/Info.plist"
-    [[ -f $info ]] || info="$OC/Kexts/$name/Contents/Info.plist"
-    for dep in ${(f)"$(plist_get "$info" OSBundleLibraries)"}; do
+    for dep in ${(f)"$(plist_get "$WORK/staged/$name/Contents/Info.plist" OSBundleLibraries)"}; do
+      [[ $dep =~ $BID_RE ]] || continue
       [[ $dep == com.apple.* || -n ${present[$dep]:-} ]] && continue
       warn "$name needs $dep, which is not in your EFI. Add the kext that provides it before rebooting."
     done
   done <"$WORK/new-kexts"
 }
 
-do_install() {
-  local dry=$1 i j backup="" failed=0
-  print -r -- ""
-  if (( dry )); then say "${C_B}Dry run${C_R}: downloads and checks everything; the EFI is not changed."
-  else say "${C_B}Installing${C_R} into $OC"; fi
-  if (( ! dry )) && (( NEED_SUDO )); then
-    say "Writing to the EFI needs administrator rights (macOS asks for your password)."
-    sudo -v || die "sudo was not granted; nothing was changed"
-  fi
-  if (( ! dry )); then
-    backup=$(backup_oc) || exit 1
-    ok "backup of EFI/OC in $backup"
-  fi
+prepare() { # phase 1; returns 1 when anything failed
+  local dry=$1 i j failed=0 k f bid
   CFG=$WORK/config.plist
   cp "$OC/config.plist" "$CFG" || die "could not read $OC/config.plist"
-  mkdir -p "$WORK/dl" "$WORK/staged"
-  : >"$WORK/new-kexts"; : >"$WORK/new-bundles"
+  plutil -lint -s "$CFG" || die "your config.plist does not validate as it is; fix it before installing anything"
+  rm -rf "$WORK/dl" "$WORK/staged" "$WORK/x"; mkdir -p "$WORK/dl" "$WORK/staged"
+  : >"$WORK/new-kexts"
+  PLAN_OLD=() EFI_BID=()
+  for f in "$OC"/Kexts/*.kext; do
+    bid=$(plist_get "$f/Contents/Info.plist" CFBundleIdentifier) && [[ -n $bid ]] && EFI_BID[${f:t}]=$bid
+  done
   for (( i = 1; i <= ${#K_ID}; i++ )); do
     (( SEL[i] )) || continue
     say ""; say "${C_B}$K_NAME[i]${C_R} $K_VER[i]"
@@ -755,73 +810,110 @@ do_install() {
     for (( j = 1; j <= ${#as}; j++ )); do
       [[ ${ASEL[i][j]} == 1 ]] || continue
       local -a p; p=("${(@s:,:)as[j]}")
+      [[ $p[1] == *.zip ]] || { warn "$p[1] is not a zip; skipping it"; failed=1; continue }
       local url="$K_SRC[i]/releases/download/$K_TAG[i]/$p[1]"
       [[ -n ${OPENKEXT_ASSET_BASE:-} ]] && url="$OPENKEXT_ASSET_BASE/$K_ID[i]/$p[1]"
       local dest="$WORK/dl/$K_ID[i]-$p[1]"
       if ! download_asset "$url" "$p[2]" "$dest"; then
-        warn "skipping $p[1]: download failed or did not match the catalog"; failed=1; continue
+        warn "$p[1]: download failed or did not match the catalog"; failed=1; continue
       fi
       ok "downloaded $p[1], SHA-256 matches the catalog"
       local x="$WORK/x/$K_ID[i]-$j"
       mkdir -p "$x"
-      if [[ $p[1] == *.zip ]]; then
-        ditto -x -k "$dest" "$x" 2>/dev/null || { warn "could not unpack $p[1]"; failed=1; continue }
-      else
-        warn "$p[1] is not a zip; skipping it"; continue
-      fi
-      local k found=0
-      for k in ${(f)"$(find_kexts "$x")"}; do
-        [[ -n $k ]] || continue
+      ditto -x -k "$dest" "$x" 2>/dev/null || { warn "could not unpack $p[1]"; failed=1; continue }
+      collect_kexts "$x"
+      local staged=0
+      for k in $KX; do
         kext_ok "$k" || continue
-        found=1
-        ditto "$k" "$WORK/staged/${k:t}"
-        install_kext "$k" "$K_ID[i]" "$K_VER[i]" "$dry" || { warn "could not install ${k:t}"; failed=1 }
+        stage_kext "$k" "$K_ID[i]" "$K_VER[i]" "$K_BUNDLES[i]" "$dry" || { warn "could not prepare ${k:t}"; failed=1; continue }
+        [[ -d $WORK/staged/${k:t} ]] && staged=1
       done
-      (( found )) || warn "$p[1] holds no kext"
+      (( staged )) || { warn "$p[1] holds none of this project's kexts"; failed=1 }
     done
   done
   check_deps
-  if ! plutil -lint -s "$CFG"; then
-    warn "the edited config.plist does not validate"
-    if (( ! dry )); then
-      w ditto "$backup/OC" "$OC" && warn "restored EFI/OC from $backup"
-    fi
-    exit 1
-  fi
+  plutil -lint -s "$CFG" || { warn "the edited config.plist does not validate"; failed=1 }
+  return $failed
+}
+
+commit() { # phase 2
+  local name old
+  (( NEED_SUDO )) && { sudo -v || die "sudo was not granted; nothing was changed" }
+  BACKUP=$(backup_oc pre-install) || die "the backup failed; nothing was changed"
+  ok "backup of EFI/OC in $BACKUP"
+  DIRTY=1
+  for name in ${(k)PLAN_OLD}; do
+    w rm -rf "$OC/Kexts/.openkext-new-$name"
+    w ditto "$WORK/staged/$name" "$OC/Kexts/.openkext-new-$name" || { warn "could not copy $name to the EFI"; exit 1 }
+  done
+  for name in ${(k)PLAN_OLD}; do
+    old=$PLAN_OLD[$name]
+    [[ -n $old ]] && { w rm -rf "$OC/Kexts/$old" || exit 1 }
+    w rm -rf "$OC/Kexts/$name" || exit 1
+    w mv "$OC/Kexts/.openkext-new-$name" "$OC/Kexts/$name" || exit 1
+  done
+  [[ -n ${OPENKEXT_TEST_FAIL_COMMIT:-} ]] && exit 1   # tests: fail halfway through phase 2
+  w cp "$CFG" "$OC/config.plist.openkext-tmp" || exit 1
+  plutil -lint -s "$OC/config.plist.openkext-tmp" || exit 1
+  w mv "$OC/config.plist.openkext-tmp" "$OC/config.plist" || exit 1
+  DIRTY=0
+  ok "kexts copied and config.plist written"
+}
+
+do_install() {
+  local dry=$1 i
+  print -r -- ""
+  if (( dry )); then say "${C_B}Dry run${C_R}: downloads and checks everything; the EFI is not changed."
+  else say "${C_B}Preparing${C_R} (the EFI is not touched until everything is ready)"; fi
+  local failed=0
+  prepare $dry || failed=1
   if (( dry )); then
     cp "$CFG" "$STATE/dry-run-config.plist" 2>/dev/null
-    say ""; ok "dry run finished; the config.plist it would write is in $STATE/dry-run-config.plist"
+    say ""
+    (( failed )) && warn "a real install would stop here, because of the problems above"
+    ok "dry run finished; the config.plist it would write is in $STATE/dry-run-config.plist"
     return $failed
   fi
-  w cp "$CFG" "$OC/config.plist" || die "could not write config.plist; restore with: openkext --restore"
-  ok "config.plist written and validated"
+  (( failed )) && die "stopped because of the problems above; nothing was changed"
+  (( ${#PLAN_OLD} )) || { say "Nothing to install."; return 0 }
+  say ""; say "${C_B}Installing${C_R} into $OC"
+  commit
   say ""
   say "${C_B}Done.${C_R} Reboot to load the new drivers."
-  say "If the machine does not boot, start from your USB installer and run 'openkext --restore',"
-  say "or copy $backup/OC back to EFI/OC by hand."
+  say "If the machine does not boot: start it from your USB installer, mount this EFI and copy"
+  say "  $BACKUP/OC"
+  say "over EFI/OC (the backup is on your macOS disk). Once back in macOS, 'openkext --restore' does the same."
   for (( i = 1; i <= ${#K_ID}; i++ )); do
     (( SEL[i] )) && say "After testing, tell others how it went: $API/kext/$K_ID[i]/"
   done
-  return $failed
+  return 0
 }
 
 do_restore() {
   locate_efi 1 || die "could not find the EFI. Mount it and pass --efi /Volumes/EFI"
-  local -a backups labels; local b
-  backups=("$STATE"/backups/*(/On))
-  (( ${#backups} )) || die "no backups in $STATE/backups"
-  for b in $backups; do
-    labels+=("${b:t}  $(grep -h '^efi=' "$b/manifest.txt" 2>/dev/null | cut -d= -f2-)")
+  tui_close
+  local -a backups labels cand; local b kind oc
+  for b in "$STATE"/backups/*(/On); do
+    backup_ok "$b" || continue
+    kind=$(manifest "$b" kind); oc=$(manifest "$b" oc)
+    [[ $oc == "$OC" ]] || continue
+    [[ $kind == pre-restore ]] && continue
+    backups+=("$b"); labels+=("${b:t}  before an install")
   done
+  # backups taken before a restore come last: picking one undoes a restore
+  for b in "$STATE"/backups/*(/On); do
+    backup_ok "$b" && [[ $(manifest "$b" oc) == "$OC" && $(manifest "$b" kind) == pre-restore ]] || continue
+    backups+=("$b"); labels+=("${b:t}  before a restore (undoes that restore)")
+  done
+  (( ${#backups} )) || die "no complete backups of $OC in $STATE/backups"
   if (( O_YES )); then REPLY_IDX=1
   else tui_menu "Restore which backup into $OC?" "The current EFI/OC is backed up first." $labels || exit 0; tui_close; fi
   b=$backups[REPLY_IDX]
-  [[ -f $b/OC/config.plist ]] || die "$b does not look like an OpenCore backup"
   (( NEED_SUDO )) && { say "Writing to the EFI needs administrator rights."; sudo -v || exit 1 }
-  local pre; pre=$(backup_oc) || exit 1
+  local pre; pre=$(backup_oc pre-restore) || die "could not back up the current EFI/OC; nothing was changed"
   ok "current EFI/OC saved in $pre"
-  w rm -rf "$OC" && w ditto "$b/OC" "$OC" || die "restore failed; the previous EFI/OC is in $pre"
-  ok "restored $b into $OC"
+  restore_into "$b" || die "restore failed; $OC is unchanged or still in $OC.openkext-old"
+  ok "restored ${b:t} into $OC"
 }
 
 print_list() {

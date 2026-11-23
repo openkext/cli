@@ -77,12 +77,15 @@ make_assets() {
   rm -rf "$T/assets" "$T/src"
   mkdir -p "$T/assets/demo-wifi" "$T/assets/broken-bt" "$T/assets/other-kext" "$T/src/tahoe" "$T/src/sequoia" "$T/src/bt" "$T/src/other"
   mkkext "$T/src/tahoe" DemoWifi com.demo.Wifi 2.0 as.vit9696.Lilu
+  mkkext "$T/src/tahoe" Extra com.demo.Extra 2.0
+  mkdir -p "$T/src/debug"; mkkext "$T/src/debug" DemoWifi com.demo.Wifi 2.0-DEBUG
   mkdir -p "$T/src/tahoe/DemoWifi.kext.dSYM/Contents"
   mkkext "$T/src/sequoia" DemoWifi com.demo.Wifi 2.0-seq
   mkkext "$T/src/bt" DemoBT com.demo.BT 2.0 com.missing.Dependency
   mkkext "$T/src/other" Other com.other.Thing 0.1
   zipdir "$T/src/tahoe" "$T/assets/demo-wifi/DemoWifi-Tahoe.zip"
   zipdir "$T/src/sequoia" "$T/assets/demo-wifi/DemoWifi-Sequoia.zip"
+  zipdir "$T/src/debug" "$T/assets/demo-wifi/DemoWifi-Tahoe-DEBUG.zip"
   zipdir "$T/src/bt" "$T/assets/demo-wifi/DemoBT.zip"
   zipdir "$T/src/bt" "$T/assets/broken-bt/BrokenBT.zip"
   zipdir "$T/src/other" "$T/assets/other-kext/Other.zip"
@@ -106,10 +109,12 @@ make_catalog() {
    {"version": "2.0", "tag": "v2.0", "date": "2026-11-01", "notes": "new", "assets": [
      {"name": "DemoWifi-Tahoe.zip", "sha256": "$(sha "$T/assets/demo-wifi/DemoWifi-Tahoe.zip")", "macos": "26"},
      {"name": "DemoWifi-Sequoia.zip", "sha256": "$(sha "$T/assets/demo-wifi/DemoWifi-Sequoia.zip")", "macos": "15"},
+     {"name": "DemoWifi-Tahoe-DEBUG.zip", "sha256": "$(sha "$T/assets/demo-wifi/DemoWifi-Tahoe-DEBUG.zip")", "macos": "26"},
      {"name": "DemoBT.zip", "sha256": "$btsha"}]}],
   "status": {"status": "author-tested", "release": "2.0"}},
  {"id": "broken-bt", "name": "Broken BT", "summary": "Reported broken.", "kind": "kext", "categories": ["bluetooth"],
   "source": "https://github.com/bob/broken-bt", "license": "MIT", "maintainers": ["bob"], "ai_disclosure": "none",
+  "bundle_ids": ["com.demo.BT"],
   "hardware": [{"vendor": "intel", "description": "Intel BT", "usb_ids": ["8087:0032"]}],
   "macos": {"min": "15.0", "max": "26.7"},
   "releases": [{"version": "0.3", "tag": "v0.3", "date": "2026-11-02", "assets": [
@@ -117,6 +122,7 @@ make_catalog() {
   "status": {"status": "reported-broken"}},
  {"id": "other-kext", "name": "Other \u001b[2Jkext", "summary": "Not for this hardware.", "kind": "kext", "categories": ["other"],
   "source": "https://github.com/carol/other", "license": "MIT", "maintainers": ["carol"], "ai_disclosure": "none",
+  "bundle_ids": ["com.other.Thing"],
   "macos": {"min": "14.0", "max": "26.7"},
   "releases": [{"version": "0.1", "tag": "v0.1", "date": "2026-11-03", "assets": [
      {"name": "Other.zip", "sha256": "$(sha "$T/assets/other-kext/Other.zip")"}]}],
@@ -129,10 +135,25 @@ make_catalog() {
   "status": {"status": "community-verified"}},
  {"id": "seq-only", "name": "Sequoia only", "summary": "x", "kind": "kext", "categories": ["other"],
   "source": "https://github.com/dan/seq", "license": "MIT", "maintainers": ["dan"], "ai_disclosure": "none",
+  "bundle_ids": ["com.dan.Seq"],
   "macos": {"min": "15.0", "max": "15.7"},
   "releases": [{"version": "1", "tag": "v1", "date": "2026-11-03", "assets": [
      {"name": "Seq.zip", "sha256": "$(printf 'd%.0s' {1..64})", "macos": "15"}]}],
   "status": {"status": "submitted"}},
+ {"id": "proto", "name": "Proto", "summary": "x", "kind": "kext", "categories": ["other"],
+  "source": "https://github.com/eve/proto", "license": "MIT", "maintainers": ["eve"], "ai_disclosure": "none",
+  "bundle_ids": ["constructor", "__proto__.x"], "hardware": [null, {"vendor": "x", "description": "x", "pci_ids": ["8086:2725"]}],
+  "macos": {"min": "14.0", "max": "26.7"},
+  "releases": [{"version": "2", "tag": "v2", "date": "2026-11-03", "assets": [
+     {"name": "Other.zip", "sha256": "$(sha "$T/assets/other-kext/Other.zip")"}]}],
+  "status": {"status": "constructor"}},
+ {"id": "nobids", "name": "No bundle ids", "summary": "x", "kind": "kext", "categories": ["other"],
+  "source": "https://github.com/eve/nobids", "license": "MIT", "maintainers": ["eve"], "ai_disclosure": "none",
+  "macos": {"min": "14.0", "max": "26.7"},
+  "releases": [{"version": "1", "tag": "v1", "date": "2026-11-03", "assets": [
+     {"name": "Other.zip", "sha256": "$(sha "$T/assets/other-kext/Other.zip")"}]}],
+  "status": {"status": "community-verified"}},
+ {"id": "malformed", "name": "M", "kind": "kext", "source": "https://github.com/eve/m", "releases": [null], "macos": null},
  {"id": "a-doc", "name": "Docs", "summary": "x", "kind": "docs", "categories": ["other"],
   "source": "https://github.com/eve/docs", "license": "MIT", "maintainers": ["eve"], "ai_disclosure": "none",
   "macos": {"min": "14.0", "max": "26.7"}, "releases": [], "status": {"status": "submitted"}}
@@ -184,6 +205,8 @@ check "list hides unmatched drivers" hasnt "other-kext"
 check "list skips docs and unsafe asset names" eval 'hasnt "a-doc" && hasnt "bad-path"'
 run --list --all --efi "$T/efi"
 check "--all shows unmatched drivers" has "other-kext  [submitted]"
+check "an entry cannot claim to be installed through prototype names" eval 'hasnt "proto  [" || has "  proto  [submitted]  install 2"'
+check "an entry without bundle_ids is listed as not installable" has "nobids  [community-verified]  not installable"
 check "catalog control characters never reach the terminal" eval '[[ $OUT != *$'"'"'\e'"'"'* ]]'
 
 # --- dry run ----------------------------------------------------------------------------------
@@ -194,7 +217,9 @@ check "dry run exits 0" test $RC -eq 0
 check "dry run leaves the EFI alone" test "$before" = "$(efihash)"
 check "dry run verifies checksums" has "downloaded DemoWifi-Tahoe.zip, SHA-256 matches the catalog"
 check "dry run skips the asset for another macOS" hasnt "DemoWifi-Sequoia.zip"
-check "dry run reports the planned change" has "would add Kexts/DemoWifi.kext (com.demo.Wifi)"
+check "debug builds are not selected by default" hasnt "DEBUG.zip"
+check "dry run reports the planned change" has "would add Kexts/DemoWifi.kext 2.0 (com.demo.Wifi)"
+check "kexts outside the project's bundle_ids are left out" has "Extra.kext is not one of this project's kexts"
 check "dry run writes the config it would use" test -f "$T/state/dry-run-config.plist"
 check "dry run makes no backup" test ! -d "$T/state/backups"
 
@@ -216,6 +241,9 @@ check "other config data preserved" eval '[[ $($PB -c "Print :Misc:Security:Vaul
 check "missing dependency is reported" has "DemoBT.kext needs com.missing.Dependency"
 check "backup made" eval 'b=("$T"/state/backups/*/OC/config.plist); (( ${#b} == 1 ))'
 check "unmatched driver not installed" test ! -d "$T/efi/EFI/OC/Kexts/Other.kext"
+check "extra kext from the zip not installed" test ! -d "$T/efi/EFI/OC/Kexts/Extra.kext"
+check "no temporary files left on the EFI" eval 'l=("$T"/efi/EFI/OC/Kexts/.openkext-* "$T"/efi/EFI/OC/config.plist.openkext-* "$T"/efi/EFI/OC.openkext-*); (( ${#l} == 0 ))'
+
 
 run --list --efi "$T/efi"
 check "installed driver shows as up to date" has "demo-wifi  [author-tested]  up to date (2.0)"
@@ -242,16 +270,40 @@ make_catalog "$(printf 'c%.0s' {1..64})"
 run --yes --efi "$T/efi"
 check "mismatch makes the run fail" test $RC -ne 0
 check "mismatch is explained" has "checksum mismatch for demo-wifi-DemoBT.zip"
-check "bad file not installed" test ! -d "$T/efi/EFI/OC/Kexts/DemoBT.kext"
-check "good file still installed" test -d "$T/efi/EFI/OC/Kexts/DemoWifi.kext"
+check "a failed file stops the whole install before the EFI is touched" eval 'has "nothing was changed" && [[ ! -d $T/efi/EFI/OC/Kexts/DemoWifi.kext && ! -d $T/state/backups ]]'
 make_catalog
+
+# --- failure in the middle of the swap rolls back ------------------------------------------------
+
+make_efi; before=$(efihash)
+OPENKEXT_TEST_FAIL_COMMIT=1 run --yes --efi "$T/efi"
+check "interrupted install fails" test $RC -ne 0
+check "interrupted install puts the EFI back exactly" test "$before" = "$(efihash)"
+check "rollback is reported" has "EFI/OC is back to how it was"
+
+# --- refusals that protect an existing EFI ---------------------------------------------------------
+
+make_efi; mkkext "$T/efi/EFI/OC/Kexts" DemoWifi com.someone.Else 9; before=$(efihash)
+run --yes --efi "$T/efi"
+check "a same-named kext with another bundle id is not overwritten" eval '(( RC != 0 )) && has "already exists with another bundle id" && [[ $before == $(efihash) ]]'
+make_efi; mkkext "$T/efi/EFI/OC/Kexts" WifiA com.demo.Wifi 1; mkkext "$T/efi/EFI/OC/Kexts" WifiB com.demo.Wifi 1; before=$(efihash)
+run --yes --efi "$T/efi"
+check "two installed copies of the same kext stop the install" eval '(( RC != 0 )) && has "2 kexts with bundle id com.demo.Wifi" && [[ $before == $(efihash) ]]'
 
 # --- restore ----------------------------------------------------------------------------------
 
+make_efi; rm -rf "$T/state"
+run --yes --efi "$T/efi"
 run --restore --yes --efi "$T/efi"
 check "restore exits 0" test $RC -eq 0
 check "restore brings back the pre-install EFI" test ! -d "$T/efi/EFI/OC/Kexts/DemoWifi.kext"
 check "restore keeps a backup of what it replaced" eval 'b=("$T"/state/backups/*); (( ${#b} == 2 ))'
+run --restore --yes --efi "$T/efi"
+check "a second --restore --yes still picks the pre-install backup" test ! -d "$T/efi/EFI/OC/Kexts/DemoWifi.kext"
+mkdir -p "$T/state/backups/29990101-000000/OC"; cp "$T/efi/EFI/OC/config.plist" "$T/state/backups/29990101-000000/OC/"
+print -r -- "kind=pre-install\noc=$T/efi/EFI/OC" >"$T/state/backups/29990101-000000/manifest.txt"
+run --restore --yes --efi "$T/efi"
+check "an incomplete backup is never restored" eval '[[ -d $T/efi/EFI/OC/Kexts/Lilu.kext ]]'
 
 # --- interactive ------------------------------------------------------------------------------
 
@@ -269,7 +321,7 @@ keys $'\n\n'
 check "interactive install" eval 'has "Done." && [[ -d $T/efi/EFI/OC/Kexts/DemoWifi.kext ]]'
 # the asset picker can drop the Bluetooth file
 make_efi
-keys $'\e[C\e[B\e[B \n\n\n'
+keys $'\e[C\e[B\e[B\e[B \n\n\n'
 check "asset picker drops a file" eval '[[ -d $T/efi/EFI/OC/Kexts/DemoWifi.kext && ! -d $T/efi/EFI/OC/Kexts/DemoBT.kext ]]'
 # nothing selected: enter is refused with a hint, then quit
 make_efi
